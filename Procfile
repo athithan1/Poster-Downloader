@@ -1,1 +1,1 @@
-web: python poster_bot.py
+web: python poster_bot_v2.py
