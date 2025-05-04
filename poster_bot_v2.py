@@ -12,13 +12,24 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 import httpx
+import logging
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
 API_KEY = "2a38c80417194db46b7389ec0bc80536"
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_BASE_URL = "https://image.tmdb.org/t/p/original"
-CHANNEL = "@athithan_220"
-ADMIN = "@ragnarlothbrockV"
+
+# *** IMPORTANT: Update these with your own channel and admin username ***
+# Also make sure to add your bot as admin to this channel with permission to check members
+CHANNEL = "@athithan_220"  # Your channel username
+ADMIN = "@ragnarlothbrockV"  # Your admin username
 WELCOME_IMG = "https://imgur.com/a/Ky9LsC4.jpg"
 
 # Conversation states
@@ -39,10 +50,11 @@ async def start(update: Update, context: CallbackContext) -> int:
             await show_force_sub(update)
             return ConversationHandler.END
     except Exception as e:
-        print(f"Force sub check error: {e}")
-        await update.message.reply_text("⚠️ Bot configuration error. Please try again later.")
-        return ConversationHandler.END
-
+        logger.error(f"Force sub check error: {e}")
+        # Skip force subscription if there's an error (usually means bot is not admin)
+        logger.info("Skipping force subscription due to error")
+        
+    # Continue with welcome message and conversation
     await send_welcome(update, user)
     return SELECT_TYPE
 
@@ -170,6 +182,7 @@ async def search_media_options(message: Update, context: CallbackContext) -> int
         return SELECT_RESULT
         
     except Exception as e:
+        logger.error(f"Search error: {e}")
         await message.reply_text(f"⚠️ Error: {str(e)}")
         return ConversationHandler.END
 
@@ -193,74 +206,40 @@ async def select_search_result(update: Update, context: CallbackContext) -> int:
         "year": (selected_item.get("release_date") or selected_item.get("first_air_date"))[:4] if (selected_item.get("release_date") or selected_item.get("first_air_date")) else "Unknown"
     })
     
+    # Create keyboard with download options
+    keyboard = [
+        [InlineKeyboardButton("Download Preview (3 Posters)", callback_data="preview_posters")],
+        [InlineKeyboardButton("Download All Posters & Backdrops", callback_data="download_all")]
+    ]
+    
     await query.edit_message_text(
         f"🎉 Selected: {context.user_data['title']}\n"
         f"📅 Year: {context.user_data['year']}\n\n"
-        f"Fetching images..."
+        f"Choose download option:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    await fetch_images(query.message, context)
+    # Add handler for the download options
+    app = context.application
+    app.add_handler(CallbackQueryHandler(handle_download_option, pattern="^(preview_posters|download_all)$"))
+    
     return ConversationHandler.END
 
-async def skip_year(update: Update, context: CallbackContext) -> int:
-    """This function is no longer used but kept for compatibility"""
+async def handle_download_option(update: Update, context: CallbackContext):
+    """Handle download option selection"""
     query = update.callback_query
     await query.answer()
-    context.user_data["year"] = None
-    await query.edit_message_text("🔍 Searching...")
-    await search_media(query.message, context)
-    return ConversationHandler.END
+    
+    download_all = query.data == "download_all"
+    
+    await query.edit_message_text(
+        f"🔍 Fetching images for {context.user_data['title']}...\n"
+        f"This may take a moment."
+    )
+    
+    await fetch_images(query.message, context, download_all=download_all)
 
-async def get_year(update: Update, context: CallbackContext) -> int:
-    """This function is no longer used but kept for compatibility"""
-    context.user_data["year"] = update.message.text
-    await update.message.reply_text("🔍 Searching...")
-    await search_media(update.message, context)
-    return ConversationHandler.END
-
-async def search_media(message: Update, context: CallbackContext):
-    """This function is kept for compatibility but no longer the main search function"""
-    media_type = context.user_data["media_type"]
-    name = context.user_data["name"]
-    year = context.user_data.get("year")
-
-    params = {
-        "api_key": API_KEY,
-        "query": name,
-        "language": "en-US",
-        "include_adult": False
-    }
-
-    if year:
-        key = "year" if media_type == "movie" else "first_air_date_year"
-        params[key] = year
-
-    try:
-        response = requests.get(f"{BASE_URL}/search/{media_type}", params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data["results"]:
-            await message.reply_text("❌ No results found")
-            return
-
-        item = data["results"][0]
-        context.user_data.update({
-            "title": item.get("title") or item.get("name"),
-            "item_id": item["id"],
-            "year": (item.get("release_date") or item.get("first_air_date"))[:4] if (item.get("release_date") or item.get("first_air_date")) else "Unknown"
-        })
-
-        await message.reply_text(
-            f"🎉 Found: {context.user_data['title']}\n"
-            f"📅 Year: {context.user_data['year']}"
-        )
-        await fetch_images(message, context)
-
-    except Exception as e:
-        await message.reply_text(f"⚠️ Error: {str(e)}")
-
-async def fetch_images(message: Update, context: CallbackContext):
+async def fetch_images(message: Update, context: CallbackContext, download_all=False):
     """Fetch and send images from TMDb"""
     media_type = context.user_data["media_type"]
     item_id = context.user_data["item_id"]
@@ -272,22 +251,32 @@ async def fetch_images(message: Update, context: CallbackContext):
         images = response.json()
 
         sent = False
-        for poster in images.get("posters", [])[:3]:
-            url = IMAGE_BASE_URL + poster["file_path"]
-            file_path = os.path.join("posters", os.path.basename(poster["file_path"]))
-            try:
-                with open(file_path, "wb") as f:
-                    f.write(requests.get(url).content)
-                await message.reply_photo(open(file_path, "rb"), caption=f"📸 {title}")
-                sent = True
-            finally:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+        posters = images.get("posters", [])
+        
+        # Limit posters to 3 unless download_all is True
+        poster_count = len(posters) if download_all else min(3, len(posters))
+        
+        if poster_count > 0:
+            await message.reply_text(f"📸 Downloading {poster_count} posters...")
+            
+            for poster in posters[:poster_count]:
+                url = IMAGE_BASE_URL + poster["file_path"]
+                file_path = os.path.join("posters", os.path.basename(poster["file_path"]))
+                try:
+                    with open(file_path, "wb") as f:
+                        f.write(requests.get(url).content)
+                    await message.reply_photo(open(file_path, "rb"), caption=f"📸 {title}")
+                    sent = True
+                finally:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
 
         # Filter backdrops to only include those with a language specified
         language_backdrops = [b for b in images.get("backdrops", []) if b.get("iso_639_1") is not None]
         
         if language_backdrops:
+            await message.reply_text(f"🏞 Downloading {len(language_backdrops)} language backdrops...")
+            
             for backdrop in language_backdrops:
                 url = IMAGE_BASE_URL + backdrop["file_path"]
                 file_path = os.path.join("backdrops", os.path.basename(backdrop["file_path"]))
@@ -309,26 +298,55 @@ async def fetch_images(message: Update, context: CallbackContext):
             await message.reply_text("🖼 No images found for this title")
 
     except Exception as e:
+        logger.error(f"Image error: {e}")
         await message.reply_text(f"⚠️ Image error: {str(e)}")
+
+async def error_handler(update, context):
+    """Handle errors in the dispatcher."""
+    error = context.error
+    logger.error(f"Error occurred: {error}")
+    
+    if hasattr(update, 'effective_message') and update.effective_message:
+        if 'Conflict' in str(error):
+            await update.effective_message.reply_text("Bot is already running in another instance. Please try again later.")
+        else:
+            await update.effective_message.reply_text("An error occurred. Please try again later.")
 
 def main() -> None:
     """Run the bot"""
-    # Use a unique session name to prevent conflicts
+    # Make sure directories exist
+    os.makedirs("posters", exist_ok=True)
+    os.makedirs("backdrops", exist_ok=True)
+    
+    # *** IMPORTANT: Replace this with your new bot token from BotFather ***
+    BOT_TOKEN = "8068956847:AAGhaww4_8cLJune7Qsl615oEf5xvHky6XI"
+    
+    # Use a unique token identifier to prevent conflicts
     app = Application.builder() \
-        .token("7896935352:AAEE_s_CU6q9ww7ovlD-9pGJo2OD3P4Mqsc") \
+        .token(BOT_TOKEN) \
         .concurrent_updates(False) \
         .request(CustomHTTPXRequest()) \
-        .get_updates_request(CustomHTTPXRequest()) \
         .build()
 
+    # Force delete webhook and drop pending updates
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
+        logger.info("Deleted webhook and dropped pending updates")
+    except Exception as e:
+        logger.error(f"Error deleting webhook: {e}")
+
+    # Add subscription check handler
     app.add_handler(CallbackQueryHandler(check_subscription, pattern="^check_sub$"))
 
+    # Main conversation flow
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             SELECT_TYPE: [CallbackQueryHandler(select_type)],
             GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            SELECT_RESULT: [CallbackQueryHandler(select_search_result)],
+            SELECT_RESULT: [CallbackQueryHandler(select_search_result, pattern="^(result_|cancel_search)")],
         },
         fallbacks=[],
     )
@@ -338,48 +356,8 @@ def main() -> None:
     # Add error handler
     app.add_error_handler(error_handler)
     
-    # First attempt to kill any other instances
-    try:
-        import os
-        import signal
-        import glob
-        pid_files = glob.glob('/proc/*/cmdline')
-        my_pid = os.getpid()
-        for pid_file in pid_files:
-            try:
-                with open(pid_file, 'r') as f:
-                    cmdline = f.read()
-                    if 'poster_bot.py' in cmdline and str(my_pid) not in pid_file:
-                        pid = int(pid_file.split('/')[2])
-                        print(f"Killing other instance with PID {pid}")
-                        os.kill(pid, signal.SIGKILL)
-            except:
-                pass
-    except:
-        pass
-        
-    # Force delete webhook to ensure we can use polling
-    try:
-        app.bot.delete_webhook(drop_pending_updates=True)
-        print("Deleted webhook and dropped pending updates")
-    except Exception as e:
-        print(f"Error deleting webhook: {e}")
-    
-    print("Starting bot with polling...")
+    logger.info("Starting bot with polling...")
     app.run_polling(drop_pending_updates=True)
 
-async def error_handler(update, context):
-    """Handle errors in the dispatcher."""
-    error = context.error
-    print(f"Error occurred: {error}")
-    
-    if hasattr(update, 'effective_message') and update.effective_message:
-        if 'Conflict' in str(error):
-            await update.effective_message.reply_text("Bot is already running in another instance. Please try again later.")
-        else:
-            await update.effective_message.reply_text("An error occurred. Please try again later.")
-
 if __name__ == "__main__":
-    os.makedirs("posters", exist_ok=True)
-    os.makedirs("backdrops", exist_ok=True)
-    main()
+    main() 
