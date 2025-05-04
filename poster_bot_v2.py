@@ -1,5 +1,7 @@
 import os
 import requests
+import tempfile
+import shutil
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +15,9 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 import httpx
 import logging
+import instaloader
+from datetime import datetime
+import re
 
 # Set up logging
 logging.basicConfig(
@@ -33,7 +38,7 @@ ADMIN = "@ragnarlothbrockV"  # Your admin username
 WELCOME_IMG = "https://imgur.com/a/Ky9LsC4.jpg"
 
 # Conversation states
-SELECT_TYPE, GET_NAME, SELECT_RESULT = range(3)
+SELECT_TYPE, GET_NAME, SELECT_RESULT, GET_INSTAGRAM_URL = range(4)
 
 class CustomHTTPXRequest(HTTPXRequest):
     def _build_client(self):
@@ -88,15 +93,18 @@ async def check_subscription(update: Update, context: CallbackContext):
 
 async def send_welcome(update: Update, user):
     """Send main welcome message"""
+    keyboard = [
+        [InlineKeyboardButton("Search Movies/Series", callback_data="start_search")],
+        [InlineKeyboardButton("Instagram Downloader", callback_data="instagram_downloader")]
+    ]
+    
     await update.message.reply_photo(
         photo=WELCOME_IMG,
         caption=f"👋 Hi {user.mention_html()}!\n"
                 f"Welcome to Media Finder!\n\n"
                 f"Created by {ADMIN}\n"
-                "Search for movies/series posters!",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Start Searching", callback_data="start_search")]
-        ]),
+                "Choose an option below:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
     )
 
@@ -116,10 +124,129 @@ async def select_type(update: Update, context: CallbackContext) -> int:
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return SELECT_TYPE
+    elif query.data == "instagram_downloader":
+        await query.edit_message_text(
+            "📷 Instagram Downloader\n\n"
+            "Send me an Instagram post, reel, or profile URL to download content."
+        )
+        return GET_INSTAGRAM_URL
     
     context.user_data["media_type"] = query.data
     await query.edit_message_caption(caption="📝 Enter the name (movie,series):")
     return GET_NAME
+
+async def get_instagram_url(update: Update, context: CallbackContext) -> int:
+    """Process Instagram URL"""
+    url = update.message.text
+    
+    # Check if this is a valid Instagram URL
+    if not is_valid_instagram_url(url):
+        await update.message.reply_text(
+            "❌ This doesn't look like a valid Instagram URL.\n\n"
+            "Please send a valid Instagram post, reel, or profile URL."
+        )
+        return GET_INSTAGRAM_URL
+    
+    await update.message.reply_text("⏳ Processing Instagram content... This may take a moment.")
+    
+    try:
+        # Download Instagram content
+        result = await download_from_instagram(url, update, context)
+        if result:
+            await update.message.reply_text(
+                "✅ Download completed!\n\n"
+                "Press /start to download more content."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Failed to download content.\n\n"
+                "This might be a private profile or the content may no longer be available."
+            )
+    except Exception as e:
+        logger.error(f"Instagram download error: {e}")
+        await update.message.reply_text(
+            f"❌ Error downloading content: {str(e)}\n\n"
+            "Please try again with a different link."
+        )
+    
+    return ConversationHandler.END
+
+def is_valid_instagram_url(url):
+    """Check if a URL is a valid Instagram URL"""
+    instagram_regex = r'(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)\/([a-zA-Z0-9_\.]+(\/)?|p\/[a-zA-Z0-9_-]+\/?|reel\/[a-zA-Z0-9_-]+\/?)'
+    return re.match(instagram_regex, url) is not None
+
+async def download_from_instagram(url, update, context):
+    """Download content from Instagram"""
+    L = instaloader.Instaloader(
+        download_videos=True,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False
+    )
+    
+    # Create temp directory for downloads
+    temp_dir = tempfile.mkdtemp()
+    try:
+        # Extract shortcode from URL
+        if '/p/' in url or '/reel/' in url:
+            shortcode = url.split('/p/')[-1].split('/')[0] if '/p/' in url else url.split('/reel/')[-1].split('/')[0]
+            shortcode = shortcode.split('?')[0]  # Remove query parameters
+            
+            # Download post
+            post = instaloader.Post.from_shortcode(L.context, shortcode)
+            L.download_post(post, target=temp_dir)
+            
+            # Send media files
+            media_sent = False
+            for filename in os.listdir(temp_dir):
+                filepath = os.path.join(temp_dir, filename)
+                if filename.endswith('.jpg') and not filename.endswith('_profile_pic.jpg'):
+                    # It's a photo
+                    await update.message.reply_photo(
+                        photo=open(filepath, 'rb'),
+                        caption=f"📸 Instagram Photo\nFrom: {post.owner_username}"
+                    )
+                    media_sent = True
+                elif filename.endswith('.mp4'):
+                    # It's a video
+                    await update.message.reply_video(
+                        video=open(filepath, 'rb'),
+                        caption=f"🎥 Instagram Video\nFrom: {post.owner_username}"
+                    )
+                    media_sent = True
+            
+            return media_sent
+        
+        # Handle profile URLs
+        elif re.search(r'instagram\.com/([a-zA-Z0-9_\.]+)/?$', url):
+            username = url.split('instagram.com/')[-1].strip('/')
+            # Download profile pic only
+            profile = instaloader.Profile.from_username(L.context, username)
+            L.download_profilepic(profile)
+            
+            # Find the profile pic
+            for filename in os.listdir('.'):
+                if username in filename and filename.endswith('.jpg'):
+                    await update.message.reply_photo(
+                        photo=open(filename, 'rb'),
+                        caption=f"👤 Profile Picture of @{username}\n"
+                               f"Full name: {profile.full_name}\n"
+                               f"Bio: {profile.biography[:100]}..."
+                    )
+                    os.remove(filename)  # Clean up
+                    return True
+        
+        return False
+    
+    except Exception as e:
+        logger.error(f"Error in Instagram download: {e}")
+        raise
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 async def get_name(update: Update, context: CallbackContext) -> int:
     """Store name and search for results"""
@@ -347,6 +474,7 @@ def main() -> None:
             SELECT_TYPE: [CallbackQueryHandler(select_type)],
             GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             SELECT_RESULT: [CallbackQueryHandler(select_search_result, pattern="^(result_|cancel_search)")],
+            GET_INSTAGRAM_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_instagram_url)],
         },
         fallbacks=[],
     )
