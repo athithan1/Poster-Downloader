@@ -43,7 +43,7 @@ ADMIN = "@ragnarlothbrockV"  # Your admin username
 WELCOME_IMG = "https://imgur.com/a/Ky9LsC4.jpg"
 
 # Conversation states
-SELECT_TYPE, GET_NAME, SELECT_RESULT, GET_INSTAGRAM_URL = range(4)
+SELECT_TYPE, GET_NAME, SELECT_RESULT, GET_INSTAGRAM_URL, EDIT_FIELD = range(5)
 
 # Railway specific configuration for deployment 
 PORT = int(os.environ.get('PORT', 8443))
@@ -830,8 +830,10 @@ async def select_search_result(update: Update, context: CallbackContext) -> int:
     
     # Create keyboard with download options
     keyboard = [
-        [InlineKeyboardButton("Download Preview (3 Posters)", callback_data="preview_posters")],
-        [InlineKeyboardButton("Download All Posters & Backdrops", callback_data="download_all")]
+        [InlineKeyboardButton("📸 Download Posters Only", callback_data="download_posters")],
+        [InlineKeyboardButton("🏞️ Download Backdrops Only", callback_data="download_backdrops")],
+        [InlineKeyboardButton("📸 Preview (3 Posters)", callback_data="preview_posters")],
+        [InlineKeyboardButton("📸🏞️ Download All Posters & Backdrops", callback_data="download_all")]
     ]
     
     await query.edit_message_text(
@@ -843,7 +845,7 @@ async def select_search_result(update: Update, context: CallbackContext) -> int:
     
     # Add handler for the download options
     app = context.application
-    app.add_handler(CallbackQueryHandler(handle_download_option, pattern="^(preview_posters|download_all)$"))
+    app.add_handler(CallbackQueryHandler(handle_download_option, pattern="^(preview_posters|download_all|download_posters|download_backdrops)$"))
     
     return ConversationHandler.END
 
@@ -852,16 +854,16 @@ async def handle_download_option(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
     
-    download_all = query.data == "download_all"
+    download_option = query.data
     
     await query.edit_message_text(
         f"🔍 Fetching images for {context.user_data['title']}...\n"
         f"This may take a moment."
     )
     
-    await fetch_images(query.message, context, download_all=download_all)
+    await fetch_images(query.message, context, download_option=download_option)
 
-async def fetch_images(message: Update, context: CallbackContext, download_all=False):
+async def fetch_images(message: Update, context: CallbackContext, download_option="preview_posters"):
     """Fetch and send images from TMDb"""
     media_type = context.user_data["media_type"]
     item_id = context.user_data["item_id"]
@@ -875,44 +877,100 @@ async def fetch_images(message: Update, context: CallbackContext, download_all=F
         sent = False
         posters = images.get("posters", [])
         
-        # Limit posters to 3 unless download_all is True
-        poster_count = len(posters) if download_all else min(3, len(posters))
+        # Determine what to download based on the option
+        download_all = download_option == "download_all"
+        download_posters = download_option in ["download_all", "download_posters", "preview_posters"]
+        download_backdrops = download_option in ["download_all", "download_backdrops"]
+        preview_only = download_option == "preview_posters"
         
-        if poster_count > 0:
+        # Handle posters if requested
+        if download_posters and posters:
+            # Limit posters to 3 for preview
+            poster_count = len(posters) if not preview_only else min(3, len(posters))
+            
             await message.reply_text(f"📸 Downloading {poster_count} posters...")
             
-            for poster in posters[:poster_count]:
+            for i, poster in enumerate(posters[:poster_count]):
                 url = IMAGE_BASE_URL + poster["file_path"]
                 file_path = os.path.join("posters", os.path.basename(poster["file_path"]))
                 try:
                     with open(file_path, "wb") as f:
                         f.write(requests.get(url).content)
-                    await message.reply_photo(open(file_path, "rb"), caption=f"📸 {title}")
+                    
+                    # Create selection buttons for each image
+                    keyboard = [
+                        [InlineKeyboardButton("Select this Poster", callback_data=f"select_poster_{i}_{item_id}")],
+                    ]
+                    
+                    # Store image URL in user data for later retrieval
+                    if "selected_images" not in context.user_data:
+                        context.user_data["selected_images"] = {}
+                    
+                    image_id = f"poster_{i}_{item_id}"
+                    context.user_data["selected_images"][image_id] = {
+                        "url": url,
+                        "type": "poster",
+                        "title": title,
+                        "file_path": poster["file_path"]
+                    }
+                    
+                    await message.reply_photo(
+                        open(file_path, "rb"), 
+                        caption=f"📸 {title}", 
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
                     sent = True
                 finally:
                     if os.path.exists(file_path):
                         os.remove(file_path)
+        elif download_posters:
+            await message.reply_text("No posters found for this title.")
 
-        # Filter backdrops to only include those with a language specified
-        language_backdrops = [b for b in images.get("backdrops", []) if b.get("iso_639_1") is not None]
-        
-        if language_backdrops:
-            await message.reply_text(f"🏞 Downloading {len(language_backdrops)} language backdrops...")
+        # Handle backdrops if requested
+        if download_backdrops:
+            # Filter backdrops to only include those with a language specified
+            language_backdrops = [b for b in images.get("backdrops", []) if b.get("iso_639_1") is not None]
             
-            for backdrop in language_backdrops:
-                url = IMAGE_BASE_URL + backdrop["file_path"]
-                file_path = os.path.join("backdrops", os.path.basename(backdrop["file_path"]))
-                language_code = backdrop.get("iso_639_1", "unknown")
-                try:
-                    with open(file_path, "wb") as f:
-                        f.write(requests.get(url).content)
-                    await message.reply_photo(open(file_path, "rb"), caption=f"🏞 {title} - Language: {language_code.upper()}")
-                    sent = True
-                finally:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-        else:
-            await message.reply_text("No language-specific backdrops found for this title.")
+            if language_backdrops:
+                await message.reply_text(f"🏞 Downloading {len(language_backdrops)} language backdrops...")
+                
+                for i, backdrop in enumerate(language_backdrops):
+                    url = IMAGE_BASE_URL + backdrop["file_path"]
+                    file_path = os.path.join("backdrops", os.path.basename(backdrop["file_path"]))
+                    language_code = backdrop.get("iso_639_1", "unknown")
+                    try:
+                        with open(file_path, "wb") as f:
+                            f.write(requests.get(url).content)
+                        
+                        # Create selection buttons for each image
+                        keyboard = [
+                            [InlineKeyboardButton("Select this Backdrop", callback_data=f"select_backdrop_{i}_{item_id}")],
+                        ]
+                        
+                        # Store image URL in user data for later retrieval
+                        if "selected_images" not in context.user_data:
+                            context.user_data["selected_images"] = {}
+                        
+                        image_id = f"backdrop_{i}_{item_id}"
+                        context.user_data["selected_images"][image_id] = {
+                            "url": url,
+                            "type": "backdrop",
+                            "title": title,
+                            "language": language_code,
+                            "file_path": backdrop["file_path"]
+                        }
+                        
+                        await message.reply_photo(
+                            open(file_path, "rb"), 
+                            caption=f"🏞 {title} - Language: {language_code.upper()}",
+                            reply_markup=InlineKeyboardMarkup(keyboard)
+                        )
+                        sent = True
+                    finally:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+            else:
+                await message.reply_text("No language-specific backdrops found for this title.")
 
         if sent:
             await message.reply_text("🎉 Thanks (This Msg From Athithan) for using me!\n⭐ Press /start to search again")
@@ -922,6 +980,209 @@ async def fetch_images(message: Update, context: CallbackContext, download_all=F
     except Exception as e:
         logger.error(f"Image error: {e}")
         await message.reply_text(f"⚠️ Image error: {str(e)}")
+
+async def handle_image_selection(update: Update, context: CallbackContext):
+    """Handle when a user selects an image"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Extract data from callback
+        callback_data = query.data
+        if callback_data.startswith("select_poster_") or callback_data.startswith("select_backdrop_"):
+            image_type, index, item_id = callback_data.split("_")[1:]
+            image_id = f"{image_type}_{index}_{item_id}"
+            
+            if "selected_images" in context.user_data and image_id in context.user_data["selected_images"]:
+                image_data = context.user_data["selected_images"][image_id]
+                
+                # Download the image again
+                url = image_data["url"]
+                file_path = os.path.join("temp", os.path.basename(image_data["file_path"]))
+                os.makedirs("temp", exist_ok=True)
+                
+                with open(file_path, "wb") as f:
+                    f.write(requests.get(url).content)
+                
+                # Create formatted message
+                title = image_data["title"]
+                
+                # Initialize message draft
+                context.user_data["message_draft"] = {
+                    "title": title,
+                    "audio": "Japanese/English",
+                    "quality": "1080p/720p",
+                    "size": "300-500MB/Episode",
+                    "link": "https://example.com"
+                }
+                
+                draft = context.user_data["message_draft"]
+                
+                # Create message with escaped formatting to prevent Markdown parsing errors
+                # Use HTML formatting which is more forgiving than Markdown
+                message_text = (
+                    "━━━━━━━━━━━━━━━━━\n"
+                    "<b>🎬 Anime Drop Alert!</b>\n"
+                    f"✨ Title: ➤ <b>{draft['title']}</b>\n"
+                    f"🎙 Audio: ➤ {draft['audio']}\n"
+                    f"🎞 Quality: ➤ {draft['quality']}\n"
+                    f"📦 File Size: ➤ {draft['size']}\n\n"
+                    "📥 Download Link:\n\n"
+                    f"🔴 Watch/Download: ➤ {draft['link']}\n\n"
+                    "♻️ Tamil Anime Vault: ➤ @athithan_220\n"
+                    "━━━━━━━━━━━━━━━━━"
+                )
+                
+                # Send the message with the selected image
+                await update.effective_message.reply_photo(
+                    photo=open(file_path, "rb"),
+                    caption=message_text,
+                    parse_mode="HTML"  # Changed to HTML for more reliable parsing
+                )
+                
+                # Add edit button to customize the message
+                keyboard = [[InlineKeyboardButton("Edit Details", callback_data=f"edit_{image_id}")]]
+                await query.edit_message_caption(
+                    caption=f"✅ Selected: {title}\nThe formatted message has been sent!",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                
+                # Clean up
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            else:
+                await query.edit_message_caption(caption="❌ Image data not found. Please try selecting again.")
+    except Exception as e:
+        logger.error(f"Selection error: {e}")
+        await query.edit_message_caption(caption=f"❌ Error processing selection: {str(e)[:100]}")
+
+async def edit_message_details(update: Update, context: CallbackContext):
+    """Handle editing of message details"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract image ID from callback data
+    image_id = query.data.split("_", 1)[1]
+    
+    # Store the image ID for the conversation
+    context.user_data["editing_image"] = image_id
+    
+    # Ask the user which field they want to edit
+    keyboard = [
+        [InlineKeyboardButton("Title", callback_data="edit_field_title")],
+        [InlineKeyboardButton("Audio", callback_data="edit_field_audio")],
+        [InlineKeyboardButton("Quality", callback_data="edit_field_quality")],
+        [InlineKeyboardButton("File Size", callback_data="edit_field_size")],
+        [InlineKeyboardButton("Download Link", callback_data="edit_field_link")],
+        [InlineKeyboardButton("Cancel", callback_data="edit_cancel")]
+    ]
+    
+    await query.edit_message_caption(
+        caption="Which field would you like to edit?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_edit_field_selection(update: Update, context: CallbackContext):
+    """Handle selection of which field to edit"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "edit_cancel":
+        await query.edit_message_caption(
+            caption="Editing cancelled.",
+            reply_markup=None
+        )
+        return ConversationHandler.END
+    
+    field = query.data.split("_")[-1]
+    context.user_data["editing_field"] = field
+    
+    field_names = {
+        "title": "Title",
+        "audio": "Audio Language",
+        "quality": "Video Quality",
+        "size": "File Size",
+        "link": "Download Link"
+    }
+    
+    await query.edit_message_caption(
+        caption=f"Please send the new value for {field_names.get(field, field)}:"
+    )
+    
+    return EDIT_FIELD
+
+async def handle_edit_field_value(update: Update, context: CallbackContext):
+    """Handle the new value for the edited field"""
+    new_value = update.message.text
+    field = context.user_data.get("editing_field")
+    image_id = context.user_data.get("editing_image")
+    
+    if not field or not image_id or "selected_images" not in context.user_data or image_id not in context.user_data["selected_images"]:
+        await update.message.reply_text("❌ Error: Missing data for editing. Please try again.")
+        return ConversationHandler.END
+    
+    # Get the image data
+    image_data = context.user_data["selected_images"][image_id]
+    title = image_data["title"]
+    
+    # Create a message draft if it doesn't exist
+    if "message_draft" not in context.user_data:
+        context.user_data["message_draft"] = {
+            "title": title,
+            "audio": "Japanese/English",
+            "quality": "1080p/720p",
+            "size": "300-500MB/Episode",
+            "link": "https://example.com"
+        }
+    
+    # Update the field
+    context.user_data["message_draft"][field] = new_value
+    
+    # Get updated values
+    draft = context.user_data["message_draft"]
+    
+    # Create updated message with HTML formatting
+    message_text = (
+        "━━━━━━━━━━━━━━━━━\n"
+        "<b>🎬 Anime Drop Alert!</b>\n"
+        f"✨ Title: ➤ <b>{draft['title']}</b>\n"
+        f"🎙 Audio: ➤ {draft['audio']}\n"
+        f"🎞 Quality: ➤ {draft['quality']}\n"
+        f"📦 File Size: ➤ {draft['size']}\n\n"
+        "📥 Download Link:\n\n"
+        f"🔴 Watch/Download: ➤ {draft['link']}\n\n"
+        "♻️ Tamil Anime Vault: ➤ @athithan_220\n"
+        "━━━━━━━━━━━━━━━━━"
+    )
+    
+    # Download the image again
+    url = image_data["url"]
+    file_path = os.path.join("temp", os.path.basename(image_data["file_path"]))
+    os.makedirs("temp", exist_ok=True)
+    
+    try:
+        with open(file_path, "wb") as f:
+            f.write(requests.get(url).content)
+        
+        # Send the updated message
+        await update.message.reply_photo(
+            photo=open(file_path, "rb"),
+            caption=message_text,
+            parse_mode="HTML"  # Changed to HTML for more reliable parsing
+        )
+        
+        await update.message.reply_text(
+            "✅ Message updated successfully! Press /start to search for more images."
+        )
+        
+        # Clean up
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Error updating message: {e}")
+        await update.message.reply_text(f"❌ Error updating message: {str(e)[:100]}")
+    
+    return ConversationHandler.END
 
 async def error_handler(update, context):
     """Handle errors in the dispatcher."""
@@ -934,11 +1195,90 @@ async def error_handler(update, context):
         else:
             await update.effective_message.reply_text("An error occurred. Please try again later.")
 
+async def start_bot(app):
+    """Start the bot with proper asyncio handling"""
+    # Delete the webhook at startup
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Deleted webhook and dropped pending updates")
+    
+    # Add subscription check handler
+    app.add_handler(CallbackQueryHandler(check_subscription, pattern="^check_sub$"))
+
+    # Add image selection handler
+    app.add_handler(CallbackQueryHandler(handle_image_selection, pattern="^select_(poster|backdrop)_"))
+    
+    # Add edit field selection handler
+    app.add_handler(CallbackQueryHandler(handle_edit_field_selection, pattern="^edit_field_"))
+    
+    # Add edit message handler
+    app.add_handler(CallbackQueryHandler(edit_message_details, pattern="^edit_[^field]"))
+    
+    # Add edit cancel handler
+    app.add_handler(CallbackQueryHandler(handle_edit_field_selection, pattern="^edit_cancel$"))
+    
+    # Add field editing conversation handler
+    edit_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_edit_field_selection, pattern="^edit_field_")],
+        states={
+            EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_value)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+    )
+    app.add_handler(edit_conv_handler)
+
+    # Main conversation flow
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            SELECT_TYPE: [CallbackQueryHandler(select_type)],
+            GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            SELECT_RESULT: [CallbackQueryHandler(select_search_result, pattern="^(result_|cancel_search)")],
+            GET_INSTAGRAM_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_instagram_url)],
+        },
+        fallbacks=[],
+    )
+
+    app.add_handler(conv_handler)
+    
+    # Add error handler
+    app.add_error_handler(error_handler)
+    
+    # Check if we're on Railway by looking for the PORT environment variable
+    if WEB_APP_URL:
+        # Use webhook mode for Railway
+        logger.info(f"Starting bot with webhook at {WEB_APP_URL}")
+        await app.start()
+        await app.set_webhook(
+            url=f"{WEB_APP_URL}/{app.bot.token}",
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    else:
+        # Use polling mode for local development
+        logger.info("Starting bot with polling...")
+        await app.initialize()
+        await app.start()
+        # Use the updater directly for polling
+        await app.updater.start_polling(drop_pending_updates=True)
+    
+    # Keep the bot running until interrupted
+    try:
+        logger.info("Bot is running. Press Ctrl+C to stop")
+        # Keep the coroutine running indefinitely
+        while True:
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped!")
+    finally:
+        # Always stop the bot properly
+        await app.stop()
+
 def main() -> None:
     """Run the bot"""
     # Make sure directories exist
     os.makedirs("posters", exist_ok=True)
     os.makedirs("backdrops", exist_ok=True)
+    os.makedirs("temp", exist_ok=True)
     
     # Force kill any other Python processes that might be using this bot token
     try:
@@ -972,53 +1312,14 @@ def main() -> None:
         .concurrent_updates(False) \
         .request(CustomHTTPXRequest()) \
         .build()
-
-    # Force delete webhook and drop pending updates
+    
+    # Use asyncio.run to properly manage the event loop
     try:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
-        logger.info("Deleted webhook and dropped pending updates")
+        asyncio.run(start_bot(app))
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user!")
     except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-
-    # Add subscription check handler
-    app.add_handler(CallbackQueryHandler(check_subscription, pattern="^check_sub$"))
-
-    # Main conversation flow
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            SELECT_TYPE: [CallbackQueryHandler(select_type)],
-            GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            SELECT_RESULT: [CallbackQueryHandler(select_search_result, pattern="^(result_|cancel_search)")],
-            GET_INSTAGRAM_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_instagram_url)],
-        },
-        fallbacks=[],
-    )
-
-    app.add_handler(conv_handler)
-    
-    # Add error handler
-    app.add_error_handler(error_handler)
-    
-    # Check if we're on Railway by looking for the PORT environment variable
-    if WEB_APP_URL:
-        # Use webhook mode for Railway
-        logger.info(f"Starting bot with webhook at {WEB_APP_URL}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEB_APP_URL}/{BOT_TOKEN}"
-        )
-    else:
-        # Use polling mode for local development
-        logger.info("Starting bot with polling...")
-        app.run_polling(drop_pending_updates=True)
+        logger.error(f"Error running bot: {e}")
 
 if __name__ == "__main__":
-    main() 
+    main()
